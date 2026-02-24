@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Sync local .env.<name> files to GitHub Environment Secrets
-# Usage: gh-dotenv-sync [options]
+# Usage: gh-envsync [options]
 
 set -euo pipefail
 
-CONFIG_FILE=".gh-dotenv-sync"
+CONFIG_FILE=".gh-envsync"
 
 display_usage() {
     cat <<USAGE
-Usage: gh-dotenv-sync [options]
+Usage: gh-envsync [options]
 
   Sync .env.<name> files to GitHub Environment Secrets.
 
-  Requires a .gh-dotenv-sync config mapping branches to environments:
+  Requires a .gh-envsync config mapping branches to environments:
     main=prd
     staging=stg
     *=dev
