@@ -4,47 +4,55 @@
 
 set -euo pipefail
 
+CONFIG_FILE=".gh-dotenv-sync"
+
 display_usage() {
     cat <<USAGE
 Usage: gh-dotenv-sync [options]
 
-Description:
-  Sync local .env.<name> files to GitHub Environment Secrets.
-  Each .env.<name> file maps to a GitHub environment called <name>.
+  Sync .env.<name> files to GitHub Environment Secrets.
 
-  Without flags, auto-detects environment from git branch:
-    main -> prd, staging -> stg, * -> dev
+  Requires a .gh-dotenv-sync config mapping branches to environments:
+    main=prd
+    staging=stg
+    *=dev
+
+  Without flags, resolves the current branch to an environment via
+  the config, copies .env.<name> to .env, and syncs to GitHub.
 
 Options:
-  -e, --env <name>
-    Sync a specific environment (e.g., --env prd syncs .env.prd)
-
-  -a, --all
-    Sync all .env.<name> files found in the current directory
-
-  -f, --force
-    Force re-sync by clearing state files
-
-  -n, --dry-run
-    Show what would be synced without making changes
-
-  -h, --help
-    Display this help message and exit
-
-Examples:
-  gh-dotenv-sync                  # Auto-detect from branch
-  gh-dotenv-sync --env prd        # Sync .env.prd to 'prd' environment
-  gh-dotenv-sync --all            # Sync all .env.<name> files
-  gh-dotenv-sync --force --all    # Force re-sync everything
+  -e, --env <name>    Sync .env.<name> directly, without config
+  -a, --all           Sync all environments in config
+  -f, --force         Re-sync even if nothing changed
+  -n, --dry-run       Preview without syncing
+  -h, --help          Show this help
 
 USAGE
 }
 
-# Check gh is available
-if ! command -v gh &>/dev/null; then
-    echo "error: gh CLI not found. Install it: https://cli.github.com" >&2
+die() {
+    for msg in "$@"; do
+        echo "$msg" >&2
+    done
     exit 1
-fi
+}
+
+require_config() {
+    [[ -f "$CONFIG_FILE" ]] || die \
+        "error: no $CONFIG_FILE config file found" \
+        "hint: create one with branch=env mappings (e.g., main=prd)"
+}
+
+# Parse a config line. Sets _key and _value globals. Returns 1 to skip.
+parse_config_line() {
+    _key="$1"; _value="$2"
+    [[ "$_key" =~ ^[[:space:]]*# || -z "$_key" ]] && return 1
+    _key="${_key## }"; _key="${_key%% }"
+    _value="${_value## }"; _value="${_value%% }"
+}
+
+# Check gh is available
+command -v gh &>/dev/null || die "error: gh CLI not found. Install it: https://cli.github.com"
 
 # Parse args
 FORCE=""
@@ -58,24 +66,18 @@ while [[ $# -gt 0 ]]; do
         -a | --all) SYNC_ALL="1"; shift ;;
         -n | --dry-run) DRY_RUN="1"; shift ;;
         -e | --env)
-            if [[ -z "${2:-}" ]]; then
-                echo "error: --env requires a value" >&2
-                exit 1
-            fi
+            [[ -n "${2:-}" ]] || die "error: --env requires a value"
             TARGET_ENV="$2"; shift 2 ;;
         -h | --help) display_usage; exit 0 ;;
-        *)
-            echo "error: unknown option -- '$1'" >&2
-            echo "try '--help' for more information" >&2
-            exit 1 ;;
+        *) die "error: unknown option -- '$1'" "try '--help' for more information" ;;
     esac
 done
 
+# Validate flag combinations
+[[ -z "$SYNC_ALL" || -z "$TARGET_ENV" ]] || die "error: --all and --env cannot be used together"
+
 # Check gh auth
-if ! gh auth status >/dev/null 2>&1; then
-    echo "error: gh not authenticated. Run 'gh auth login'" >&2
-    exit 1
-fi
+gh auth status >/dev/null 2>&1 || die "error: gh not authenticated. Run 'gh auth login'"
 
 sync_env() {
     local env_file="$1"
@@ -87,42 +89,48 @@ sync_env() {
         return 0
     fi
 
-    # Force mode: clear state file
-    if [[ -n "$FORCE" && -f "$state_file" ]]; then
-        echo "force: clearing state for $gh_env"
-        rm "$state_file"
-    fi
-
-    # Check if sync needed
+    # Skip if unchanged (unless forcing)
     if [[ -z "$FORCE" ]] && diff -q "$env_file" "$state_file" >/dev/null 2>&1; then
         echo "skip: $gh_env unchanged"
         return 0
     fi
 
     echo "sync: $gh_env ($env_file)"
-    local changes=0
 
-    # Find deleted secrets
-    if [[ -f "$state_file" ]]; then
-        while IFS='=' read -r key _; do
+    # Load previous state (empty when forcing to re-sync everything)
+    declare -A old_secrets=()
+    if [[ -z "$FORCE" && -f "$state_file" ]]; then
+        while IFS='=' read -r key value || [[ -n "$key" ]]; do
             [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
-            if ! grep -q "^${key}=" "$env_file"; then
-                if [[ -n "$DRY_RUN" ]]; then
-                    echo "  - $key (delete)"
-                else
-                    gh secret delete "$key" --env "$gh_env" 2>/dev/null && echo "  - $key"
-                fi
-                changes=$((changes + 1))
-            fi
+            old_secrets["$key"]="$value"
         done < "$state_file"
     fi
 
-    # Find new/changed secrets
-    while IFS='=' read -r key value; do
+    # Load current env file
+    declare -A new_secrets=()
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
         [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
-        old_line=$(grep "^${key}=" "$state_file" 2>/dev/null || true)
-        new_line="${key}=${value}"
-        if [[ "$old_line" != "$new_line" ]]; then
+        new_secrets["$key"]="$value"
+    done < "$env_file"
+
+    local changes=0
+
+    # Deleted: keys in old not in new
+    for key in "${!old_secrets[@]}"; do
+        if [[ -z "${new_secrets[$key]+x}" ]]; then
+            if [[ -n "$DRY_RUN" ]]; then
+                echo "  - $key (delete)"
+            else
+                gh secret delete "$key" --env "$gh_env" 2>/dev/null && echo "  - $key"
+            fi
+            changes=$((changes + 1))
+        fi
+    done
+
+    # Changed/added: keys new or different from old
+    for key in "${!new_secrets[@]}"; do
+        if [[ -z "${old_secrets[$key]+x}" ]] || [[ "${old_secrets[$key]}" != "${new_secrets[$key]}" ]]; then
+            local value="${new_secrets[$key]}"
             # Strip surrounding quotes
             value="${value#\"}"; value="${value%\"}"
             value="${value#\'}"; value="${value%\'}"
@@ -133,7 +141,7 @@ sync_env() {
             fi
             changes=$((changes + 1))
         fi
-    done < "$env_file"
+    done
 
     if [[ -z "$DRY_RUN" ]]; then
         cp "$env_file" "$state_file"
@@ -141,43 +149,63 @@ sync_env() {
     echo "  $changes change(s)"
 }
 
-if [[ -n "$SYNC_ALL" ]]; then
-    # Sync all .env.<name> files
-    found=0
-    for env_file in .env.*; do
-        [[ ! -f "$env_file" ]] && continue
-        # Skip state files and .env.example
-        [[ "$env_file" == .env.sync.* ]] && continue
-        [[ "$env_file" == .env.example ]] && continue
+resolve_env() {
+    local branch="$1"
+    local wildcard=""
+    while IFS='=' read -r _key _value || [[ -n "$_key" ]]; do
+        parse_config_line "$_key" "$_value" || continue
+        if [[ "$_key" == "$branch" ]]; then
+            echo "$_value"
+            return 0
+        fi
+        if [[ "$_key" == "*" ]]; then
+            wildcard="$_value"
+        fi
+    done < "$CONFIG_FILE"
 
-        gh_env="${env_file#.env.}"
-        sync_env "$env_file" "$gh_env"
-        found=1
-    done
-    if [[ "$found" -eq 0 ]]; then
-        echo "error: no .env.<name> files found" >&2
-        exit 1
+    if [[ -n "$wildcard" ]]; then
+        echo "$wildcard"
+        return 0
     fi
+
+    die "error: branch '$branch' not mapped in $CONFIG_FILE"
+}
+
+if [[ -n "$SYNC_ALL" ]]; then
+    require_config
+    declare -A seen_envs
+    while IFS='=' read -r _key _value || [[ -n "$_key" ]]; do
+        parse_config_line "$_key" "$_value" || continue
+        [[ -n "${seen_envs[$_value]:-}" ]] && continue
+        seen_envs[$_value]=1
+        sync_env ".env.${_value}" "$_value"
+    done < "$CONFIG_FILE"
+    [[ ${#seen_envs[@]} -gt 0 ]] || die "error: no environments defined in $CONFIG_FILE"
 elif [[ -n "$TARGET_ENV" ]]; then
-    # Sync specific environment
     sync_env ".env.${TARGET_ENV}" "$TARGET_ENV"
 else
-    # Auto-detect from git branch
-    branch=$(git branch --show-current 2>/dev/null || echo "dev")
-    case "$branch" in
-        main | master) gh_env="prd" ;;
-        staging) gh_env="stg" ;;
-        *) gh_env="dev" ;;
-    esac
+    branch=$(git branch --show-current 2>/dev/null)
+    [[ -n "$branch" ]] || die \
+        "error: could not detect branch (detached HEAD?)" \
+        "hint: use --env <name> to sync a specific environment"
+
+    require_config
+    gh_env=$(resolve_env "$branch") || exit 1
 
     env_file=".env.${gh_env}"
-    if [[ ! -f "$env_file" ]]; then
-        echo "error: $env_file not found (branch: $branch)" >&2
-        exit 1
-    fi
+    [[ -f "$env_file" ]] || die "error: $env_file not found (branch: $branch -> $gh_env)"
 
-    # Copy to .env for local use
+    # Copy to .env for local use, protecting manual edits
+    local_state=".env.sync.local"
+    if [[ -f .env ]]; then
+        current_sum=$(md5sum .env | cut -d' ' -f1)
+        stored_sum=$(cut -d' ' -f1 < "$local_state" 2>/dev/null || true)
+        [[ "$current_sum" == "$stored_sum" ]] || die \
+            "error: .env has unsaved changes" \
+            "hint: move your changes to $env_file and re-run"
+    fi
     cp "$env_file" .env
+    md5sum .env > "$local_state"
     echo "load: $env_file -> .env (branch: $branch)"
 
     sync_env "$env_file" "$gh_env"
