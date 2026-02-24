@@ -1,0 +1,5 @@
+.direnv
+.pre-commit-config.yaml
+.wip
+/result
+.env.sync.*.last
