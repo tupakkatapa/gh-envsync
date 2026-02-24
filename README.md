@@ -21,7 +21,7 @@ Description:
     main -> prd, staging -> stg, * -> dev
 
 Options:
-  -e, --env <name>    Sync a specific environment (e.g., --env prod syncs .env.prod)
+  -e, --env <name>    Sync a specific environment (e.g., --env prd syncs .env.prd)
   -a, --all           Sync all .env.<name> files found in the current directory
   -f, --force         Force re-sync by clearing state files
   -n, --dry-run       Show what would be synced without making changes
@@ -52,7 +52,7 @@ gh-dotenv-sync
 ### Examples
 
 ```bash
-gh-dotenv-sync --env prod       # Sync .env.prod to 'prod' environment
+gh-dotenv-sync --env prd        # Sync .env.prd to 'prd' environment
 gh-dotenv-sync --all            # Sync all .env.<name> files
 gh-dotenv-sync --force --all    # Force re-sync everything
 gh-dotenv-sync --dry-run --all  # Preview changes without syncing
